@@ -1,0 +1,241 @@
+// ════════════════════════════════════════════════════════════════════
+// WA Gateway (Baileys) — base operacional reconstruída.
+//
+// Expõe os contratos que API e Worker já consomem:
+//   GET  /status                      -> { status, hasQr }
+//   GET  /qr                          -> { qr }   (data URL do QR)
+//   GET  /contacts?q=&limit=          -> [{ name, phone, uncertain }]
+//   POST /send       { to, text, replyTo? }
+//   POST /send-media { to, type, url, caption }
+//   GET  /health
+// E faz POST no WEBHOOK_URL a cada mensagem recebida:
+//   { from, text, pushName, fromLid, fromReal, replyTo }
+//
+// Fixes preservados:
+//   - contatos LID não resolvidos saem com uncertain:true
+//   - deduplicação por nome no /contacts
+//
+// Sessão persiste em AUTH_DIR (volume wa_auth) -> restaurar evita re-escanear QR.
+// ════════════════════════════════════════════════════════════════════
+import express from "express";
+import qrcode from "qrcode";
+import pino from "pino";
+import { Boom } from "@hapi/boom";
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} from "@whiskeysockets/baileys";
+
+const PORT = process.env.PORT || 3333;
+const AUTH_DIR = process.env.AUTH_DIR || "/app/auth";
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "http://api:3000/api/internal/message";
+
+const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
+
+// ── estado em memória ──────────────────────────────────────────────
+let sock = null;
+let status = "starting";          // starting | qr | connected | disconnected
+let qrDataUrl = null;             // data URL do último QR
+const contacts = new Map();       // jid -> { name, phone, uncertain }
+
+// ── helpers ─────────────────────────────────────────────────────────
+const onlyDigits = (s = "") => String(s).replace(/\D/g, "");
+const isLid = (jid = "") => /@lid$/i.test(jid);
+const phoneFromJid = (jid = "") => onlyDigits(String(jid).replace(/[:@].*$/, ""));
+const jidFromPhone = (p = "") => `${onlyDigits(p)}@s.whatsapp.net`;
+
+function rememberContact(jid, name) {
+  if (!jid) return;
+  const phone = phoneFromJid(jid);
+  if (!phone) return;
+  const uncertain = isLid(jid);                // LID não resolvido = incerto
+  const prev = contacts.get(jid) || {};
+  const nm = (name && String(name).trim()) || prev.name || "";
+  contacts.set(jid, { name: nm, phone, uncertain: uncertain && !nm ? true : !!prev.uncertain && uncertain });
+  // se temos nome, deixa de ser incerto
+  if (nm) contacts.set(jid, { name: nm, phone, uncertain: false });
+  else contacts.set(jid, { name: nm, phone, uncertain });
+}
+
+function listContacts(q = "", limit = 50) {
+  const term = String(q || "").toLowerCase().trim();
+  const out = [];
+  const seenName = new Set();   // dedup por nome (fix preservado)
+  const seenPhone = new Set();
+  for (const c of contacts.values()) {
+    if (!c.phone) continue;
+    if (term && !(`${c.name}`.toLowerCase().includes(term) || c.phone.includes(onlyDigits(term)))) continue;
+    const nameKey = (c.name || "").toLowerCase().trim();
+    if (nameKey && seenName.has(nameKey)) continue;
+    if (seenPhone.has(c.phone)) continue;
+    if (nameKey) seenName.add(nameKey);
+    seenPhone.add(c.phone);
+    out.push({ name: c.name || "", phone: c.phone, uncertain: !!c.uncertain });
+    if (out.length >= Number(limit || 50)) break;
+  }
+  // contatos com nome primeiro, depois incertos
+  out.sort((a, b) => (a.uncertain - b.uncertain) || (b.name ? 1 : 0) - (a.name ? 1 : 0));
+  return out;
+}
+
+function extractText(msg) {
+  const m = msg.message || {};
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.buttonsResponseMessage?.selectedButtonId ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    ""
+  );
+}
+
+async function postWebhook(payload) {
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    logger.warn(`webhook falhou: ${e.message}`);
+  }
+}
+
+// ── conexão Baileys ─────────────────────────────────────────────────
+async function start() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    browser: ["AutoFlow", "Chrome", "1.0.0"],
+    syncFullHistory: false,
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (u) => {
+    const { connection, lastDisconnect, qr } = u;
+    if (qr) {
+      status = "qr";
+      try { qrDataUrl = await qrcode.toDataURL(qr); } catch { qrDataUrl = null; }
+      logger.warn("QR disponível — escaneie no WhatsApp.");
+    }
+    if (connection === "open") {
+      status = "connected";
+      qrDataUrl = null;
+      logger.warn("✅ WhatsApp conectado.");
+    }
+    if (connection === "close") {
+      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const loggedOut = code === DisconnectReason.loggedOut;
+      status = "disconnected";
+      logger.warn(`conexão fechada (code=${code}) loggedOut=${loggedOut}`);
+      if (!loggedOut) {
+        setTimeout(() => start().catch((e) => logger.error(e.message)), 2500); // reconecta
+      } else {
+        qrDataUrl = null; // sessão encerrada — próximo start gera novo QR
+        setTimeout(() => start().catch((e) => logger.error(e.message)), 1500);
+      }
+    }
+  });
+
+  // contatos (eventos variam por versão — todos defensivos)
+  sock.ev.on("contacts.upsert", (arr = []) => {
+    for (const c of arr) rememberContact(c.id, c.name || c.notify || c.verifiedName);
+  });
+  sock.ev.on("contacts.set", ({ contacts: arr = [] } = {}) => {
+    for (const c of arr) rememberContact(c.id, c.name || c.notify || c.verifiedName);
+  });
+  sock.ev.on("messaging-history.set", ({ contacts: arr = [] } = {}) => {
+    for (const c of arr) rememberContact(c.id, c.name || c.notify || c.verifiedName);
+  });
+
+  // mensagens recebidas -> webhook
+  sock.ev.on("messages.upsert", async ({ messages = [], type }) => {
+    if (type !== "notify") return;
+    for (const msg of messages) {
+      try {
+        if (!msg.message || msg.key.fromMe) continue;
+        const remoteJid = msg.key.remoteJid || "";
+        if (remoteJid === "status@broadcast" || remoteJid.endsWith("@g.us")) continue; // ignora status e grupos
+        const text = extractText(msg);
+        if (!text) continue;
+
+        const pushName = msg.pushName || "";
+        rememberContact(remoteJid, pushName);
+
+        const realDigits = remoteJid.endsWith("@s.whatsapp.net") ? phoneFromJid(remoteJid) : "";
+        const lidDigits = isLid(remoteJid) ? phoneFromJid(remoteJid) : "";
+
+        await postWebhook({
+          from: remoteJid,
+          text,
+          pushName,
+          fromReal: realDigits,
+          fromLid: lidDigits,
+          replyTo: remoteJid,
+        });
+      } catch (e) {
+        logger.warn(`erro processando msg: ${e.message}`);
+      }
+    }
+  });
+}
+
+// ── envio ───────────────────────────────────────────────────────────
+function targetJid({ to, replyTo }) {
+  if (replyTo && String(replyTo).includes("@")) return replyTo; // usa o jid original (resolve @lid)
+  return jidFromPhone(to);
+}
+
+async function sendText({ to, text, replyTo }) {
+  if (!sock || status !== "connected") throw new Error("not_connected");
+  const jid = targetJid({ to, replyTo });
+  const r = await sock.sendMessage(jid, { text: String(text || "") });
+  return { ok: true, id: r?.key?.id || null, jid };
+}
+
+async function sendMedia({ to, type, url, caption }) {
+  if (!sock || status !== "connected") throw new Error("not_connected");
+  const jid = jidFromPhone(to);
+  let content;
+  if (type === "image") content = { image: { url }, caption: caption || "" };
+  else if (type === "video") content = { video: { url }, caption: caption || "" };
+  else if (type === "document") content = { document: { url }, fileName: caption || "arquivo" };
+  else content = { text: caption || "" };
+  const r = await sock.sendMessage(jid, content);
+  return { ok: true, id: r?.key?.id || null, jid };
+}
+
+// ── HTTP ────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+
+app.get("/health", (_req, res) => res.json({ ok: true, status }));
+app.get("/status", (_req, res) => res.json({ status, hasQr: !!qrDataUrl }));
+app.get("/qr", (_req, res) => res.json({ qr: qrDataUrl, status }));
+
+app.get("/contacts", (req, res) => {
+  res.json(listContacts(req.query.q, req.query.limit));
+});
+
+app.post("/send", async (req, res) => {
+  try { res.json(await sendText(req.body || {})); }
+  catch (e) { res.status(e.message === "not_connected" ? 409 : 500).json({ error: e.message }); }
+});
+
+app.post("/send-media", async (req, res) => {
+  try { res.json(await sendMedia(req.body || {})); }
+  catch (e) { res.status(e.message === "not_connected" ? 409 : 500).json({ error: e.message }); }
+});
+
+app.listen(PORT, () => logger.warn(`✅ WA Gateway :${PORT}`));
+start().catch((e) => { logger.error(`falha ao iniciar: ${e.message}`); status = "disconnected"; });

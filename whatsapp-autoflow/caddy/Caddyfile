@@ -1,0 +1,8 @@
+# Defina SITE_ADDRESS no .env:
+#   SITE_ADDRESS=app.seudominio.com   -> HTTPS automático (Let's Encrypt)
+#   SITE_ADDRESS=:80                   -> só HTTP (default, p/ testar sem domínio)
+{$SITE_ADDRESS:-:80} {
+	encode zstd gzip
+	# tudo vai para o nginx do front, que serve o SPA e faz proxy de /api
+	reverse_proxy web:80
+}
