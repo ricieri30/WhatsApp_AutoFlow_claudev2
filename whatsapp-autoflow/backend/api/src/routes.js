@@ -14,6 +14,28 @@ import { makeQueue, upsertRecurringScheduler, removeRecurringScheduler } from ".
 const router = express.Router();
 const queue = makeQueue();
 
+// ── Helper resiliente p/ falar com o wa-gateway: timeout + nunca lanca ──
+async function gatewayFetch(pathname, { method = "GET", body, timeoutMs = 4000 } = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(`${process.env.WA_GATEWAY_URL}${pathname}`, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    const txt = await r.text();
+    let data = {};
+    try { data = txt ? JSON.parse(txt) : {}; } catch { data = { raw: txt }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 503, data: { error: "gateway_unreachable", message: e.name === "AbortError" ? "timeout" : e.message } };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════
 // HELPERS COMPARTILHADOS — usados por /auto-reply/test e /internal/message
 // Garante que o TESTE e a PRODUÇÃO usem exatamente a mesma lógica.
@@ -55,10 +77,15 @@ function evaluateRule(rule, msgText, candidates) {
   // Match tolerante: igualdade exata OU mesmos ultimos 8 digitos
   // (resolve nono digito BR e LID nao resolvido)
   if (rulePhone) {
-    const tail = (n) => String(n || '').slice(-8);
-    const rt = tail(rulePhone);
-    const hit = candidates.has(rulePhone) ||
-      (rt.length === 8 && [...candidates].some(c => tail(c) === rt));
+    // Match exato OU um numero e sufixo do outro (>=8 digitos) — reduz colisao cross-DDD
+    const phonesMatch = (a, b) => {
+      if (!a || !b) return false;
+      if (a === b) return true;
+      const longer  = a.length >= b.length ? a : b;
+      const shorter = a.length >= b.length ? b : a;
+      return shorter.length >= 8 && longer.endsWith(shorter);
+    };
+    const hit = [...candidates].some(c => phonesMatch(rulePhone, c));
     if (!hit) return "numero_diferente";
   }
   // Horário
@@ -157,26 +184,22 @@ router.get("/dashboard", auth, async (_req, res) => {
 
 // ── WhatsApp ──────────────────────────────────────────────────────
 router.get("/whatsapp/status", auth, async (_req, res) => {
-  const r = await fetch(`${process.env.WA_GATEWAY_URL}/status`);
-  res.status(r.status).json(await r.json());
+  const r = await gatewayFetch("/status");
+  res.json(r.ok ? r.data : { status: "disconnected", hasQr: false });
 });
 
 router.get("/whatsapp/qr", auth, async (_req, res) => {
-  const r = await fetch(`${process.env.WA_GATEWAY_URL}/qr`);
-  res.status(r.status).json(await r.json());
+  const r = await gatewayFetch("/qr");
+  res.json(r.ok ? r.data : { qr: null, status: "disconnected" });
 });
 
 // GET /whatsapp/contacts?q=busca&limit=50
 router.get("/whatsapp/contacts", auth, async (req, res) => {
-  try {
-    const params = new URLSearchParams();
-    if (req.query.q)     params.set('q', req.query.q);
-    if (req.query.limit) params.set('limit', req.query.limit);
-    const r = await fetch(`${process.env.WA_GATEWAY_URL}/contacts?${params}`);
-    res.status(r.status).json(await r.json());
-  } catch {
-    res.json([]);
-  }
+  const params = new URLSearchParams();
+  if (req.query.q) params.set('q', req.query.q);
+  if (req.query.limit) params.set('limit', req.query.limit);
+  const r = await gatewayFetch(`/contacts?${params}`);
+  res.json(r.ok && Array.isArray(r.data) ? r.data : []);
 });
 
 // ── Templates ─────────────────────────────────────────────────────
