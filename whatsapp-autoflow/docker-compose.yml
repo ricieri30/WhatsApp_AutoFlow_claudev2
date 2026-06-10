@@ -126,7 +126,7 @@ services:
     build: ./web                # SPA Vite + nginx (proxy /api → api:3000)
     container_name: autoflow2_web
     ports:
-      - "127.0.0.1:3025:80"     # só local (debug); o público entra pelo Caddy
+      - "4025:80"     # só local (debug); o público entra pelo Caddy
     depends_on: [api]
     restart: unless-stopped
     networks: [autoflow2-net]
