@@ -79,6 +79,46 @@ function useToast() {
 }
 
 // Indicador de status do WhatsApp (`xo` no bundle)
+// ── Importar / Backup (export JSON + import por item) — reutilizavel ──
+function ImpExp({ data, endpoint, name, onDone, toast }) {
+  const fileRef = useRef(null);
+  function doExport() {
+    try {
+      const blob = new Blob([JSON.stringify(data || [], null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `${name}-${new Date().toISOString().slice(0,10)}.json`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      toast && toast(`Backup de ${(data||[]).length} item(ns) baixado.`, "emerald");
+    } catch (e) { toast && toast("Falha ao gerar backup.", "red"); }
+  }
+  async function doImport(e) {
+    const file = e.target.files?.[0]; if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      const items = Array.isArray(parsed) ? parsed : (parsed.items || parsed.contacts || []);
+      let ok = 0, fail = 0;
+      for (const raw of items) {
+        try {
+          const { _id, __v, createdAt, updatedAt, ...doc } = raw || {};
+          await api(endpoint, { method: "POST", body: doc });
+          ok++;
+        } catch (_) { fail++; }
+      }
+      toast && toast(`Importacao: ${ok} ok${fail ? `, ${fail} falha(s)` : ""}.`, fail ? "amber" : "indigo");
+      onDone && (await onDone());
+    } catch (_) { toast && toast("Arquivo invalido. Selecione um backup .json valido.", "red"); }
+    finally { e.target.value = ""; }
+  }
+  return (
+    <span className="flex gap-2 items-center">
+      <button type="button" onClick={() => fileRef.current?.click()} className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm transition-colors border border-slate-700"><Upload className="h-4 w-4" /> Importar</button>
+      <input ref={fileRef} type="file" accept=".json" className="hidden" onChange={doImport} />
+      <button type="button" onClick={doExport} className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm transition-colors border border-slate-700"><Download className="h-4 w-4" /> Backup</button>
+    </span>
+  );
+}
+
 function StatusDot({ status }) {
   const wrap = {
     connected: "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30",
@@ -395,9 +435,9 @@ function ContactsView({ toast }) {
           <h1 className="text-xl font-bold text-white">Clientes</h1>
           <p className="text-sm text-slate-500 mt-1">{list.length} cadastrado(s)</p>
         </div>
-        <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors">
+        <div className="flex gap-2 items-center"><ImpExp data={list} endpoint="contacts" name="clientes" onDone={load} toast={toast} /> <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors">
           <Plus className="h-4 w-4" /> Adicionar Novo Cliente
-        </button>
+        </button></div>
       </div>
 
       <div className="relative max-w-sm">
@@ -503,7 +543,7 @@ function TemplatesView({ toast }) {
           <h1 className="text-xl font-bold text-white">Templates</h1>
           <p className="text-sm text-slate-500 mt-1">Mensagens reutilizáveis com variáveis {"{{nome}}"}</p>
         </div>
-        <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Criar template</button>
+        <div className="flex gap-2 items-center"><ImpExp data={list} endpoint="templates" name="templates" onDone={load} toast={toast} /> <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Criar template</button></div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -597,7 +637,7 @@ function AutoReplyView({ toast }) {
           <h1 className="text-xl font-bold text-white">Respostas Automáticas</h1>
           <p className="text-sm text-slate-500 mt-1">Responde automaticamente quando a mensagem contém a palavra-chave.</p>
         </div>
-        <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Nova regra</button>
+        <div className="flex gap-2 items-center"><ImpExp data={list} endpoint="auto-reply" name="respostas-auto" onDone={load} toast={toast} /> <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Nova regra</button></div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -780,7 +820,7 @@ function RecurringView({ toast }) {
           <h1 className="text-xl font-bold text-white">Automações</h1>
           <p className="text-sm text-slate-500 mt-1">Disparos recorrentes via expressão Cron.</p>
         </div>
-        <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Nova automação</button>
+        <div className="flex gap-2 items-center"><ImpExp data={list} endpoint="recurring" name="automacoes" onDone={load} toast={toast} /> <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Nova automação</button></div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -935,7 +975,7 @@ function ScheduledView({ toast }) {
           <h1 className="text-xl font-bold text-white">Agendamentos</h1>
           <p className="text-sm text-slate-500 mt-1">Mensagens únicas agendadas para uma data e hora específicas.</p>
         </div>
-        <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Novo Agendamento</button>
+        <div className="flex gap-2 items-center"><ImpExp data={list} endpoint="scheduled" name="agendamentos" onDone={load} toast={toast} /> <button onClick={openNew} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm transition-colors"><Plus className="h-4 w-4" /> Novo Agendamento</button></div>
       </div>
 
       <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
