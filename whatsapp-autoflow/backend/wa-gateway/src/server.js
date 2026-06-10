@@ -193,7 +193,9 @@ async function start() {
 // ── envio ───────────────────────────────────────────────────────────
 function targetJid({ to, replyTo }) {
   if (replyTo && String(replyTo).includes("@")) return replyTo; // usa o jid original (resolve @lid)
-  return jidFromPhone(to);
+  const digits = onlyDigits(to);
+  if (!digits) throw new Error("invalid_destination"); // nunca fabrica numero a partir de LID/vazio
+  return jidFromPhone(digits);
 }
 
 async function sendText({ to, text, replyTo }) {
