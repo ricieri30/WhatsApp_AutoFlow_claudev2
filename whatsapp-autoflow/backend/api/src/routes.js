@@ -29,9 +29,48 @@ function normPhone(j = "") {
 }
 
 // Normaliza texto para comparação: minúsculas + remove espaços extras das pontas
+// === [AUTOFLOW PATCH v2] ===
 function normText(t = "") {
-  return String(t).toLowerCase().trim().replace(/\s+/g, " ");
+  return String(t)
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
+const NEGATIONS = ["nao", "nunca", "jamais", "sem", "tampouco"];
+function isNegatedBefore(msgNorm, idx) {
+  const before = msgNorm.slice(0, idx).trim().split(" ").slice(-3);
+  return before.some(w => NEGATIONS.includes(w));
+}
+function matchLoose(msgNorm, kw) {
+  let from = 0, idx;
+  while ((idx = msgNorm.indexOf(kw, from)) !== -1) {
+    if (!isNegatedBefore(msgNorm, idx)) return true;
+    from = idx + kw.length;
+  }
+  return false;
+}
+function matchStrict(msgNorm, kw) {
+  const special = ".*+?^=!:${}()|[]/\\";
+  let esc = "";
+  for (const ch of kw) { esc += special.indexOf(ch) !== -1 ? "\\" + ch : ch; }
+  const re = new RegExp("(^|[.,!?;:]\\s*)" + esc + "(\\s*[.,!?;:]|$)");
+  const m = re.exec(msgNorm);
+  if (!m) return false;
+  return !isNegatedBefore(msgNorm, m.index + m[1].length);
+}
+function keywordMatches(msgNorm, ruleKwRaw) {
+  const parts = String(ruleKwRaw).split(/[,|]/).map(x => x.trim()).filter(Boolean);
+  for (const part of parts) {
+    const strict = (part.length >= 2) && ((part[0] === "'" && part[part.length-1] === "'") || (part[0] === '"' && part[part.length-1] === '"'));
+    const core = strict ? part.slice(1, -1) : part;
+    const kw = normText(core);
+    if (!kw) continue;
+    if (strict ? matchStrict(msgNorm, kw) : matchLoose(msgNorm, kw)) return true;
+  }
+  return false;
+}
+// === [/AUTOFLOW PATCH v2] ===
 
 // Verifica se o horário atual está dentro da faixa (trata virada de meia-noite)
 function timeInRange(start = "00:00", end = "23:59") {
@@ -64,7 +103,7 @@ function evaluateRule(rule, msgText, candidates) {
   // Horário
   if (!timeInRange(rule.startTime, rule.endTime)) return "fora_horario";
   // Palavra-chave (já normalizada dos dois lados → espaço no fim não atrapalha)
-  if (!ruleKw || !msgNorm.includes(ruleKw)) return "keyword_nao_encontrada";
+  if (!keywordMatches(msgNorm, rule.keyword)) return "keyword_nao_encontrada";
   return null; // casou!
 }
 
