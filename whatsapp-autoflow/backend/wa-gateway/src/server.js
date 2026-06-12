@@ -45,6 +45,22 @@ const isLid = (jid = "") => /@lid$/i.test(jid);
 const phoneFromJid = (jid = "") => onlyDigits(String(jid).replace(/[:@].*$/, ""));
 const jidFromPhone = (p = "") => `${onlyDigits(p)}@s.whatsapp.net`;
 
+// === [AUTOFLOW PATCH BR9] ===
+async function resolveJid(digits) {
+  const d = onlyDigits(digits);
+  if (!d) return jidFromPhone(d);
+  const cands = [];
+  if (d.length === 13 && d.startsWith("55") && d[4] === "9") cands.push(d.slice(0,4) + d.slice(5));
+  if (d.length === 12 && d.startsWith("55")) cands.push(d.slice(0,4) + "9" + d.slice(4));
+  for (const cand of [d, ...cands]) {
+    try {
+      const r = await sock.onWhatsApp(cand);
+      if (Array.isArray(r) && r[0] && r[0].exists && r[0].jid) return r[0].jid;
+    } catch (e) {}
+  }
+  return jidFromPhone(d);
+}
+
 function rememberContact(jid, name) {
   if (!jid) return;
   const phone = phoneFromJid(jid);
@@ -191,21 +207,23 @@ async function start() {
 }
 
 // ── envio ───────────────────────────────────────────────────────────
-function targetJid({ to, replyTo }) {
-  if (replyTo && String(replyTo).includes("@")) return replyTo; // usa o jid original (resolve @lid)
-  return jidFromPhone(to);
+async function targetJid({ to, replyTo }) {
+  if (replyTo && String(replyTo).includes("@")) return replyTo;
+  const digits = onlyDigits(to);
+  if (!digits) throw new Error("invalid_destination");
+  return await resolveJid(digits);
 }
 
 async function sendText({ to, text, replyTo }) {
   if (!sock || status !== "connected") throw new Error("not_connected");
-  const jid = targetJid({ to, replyTo });
+  const jid = await targetJid({ to, replyTo });
   const r = await sock.sendMessage(jid, { text: String(text || "") });
   return { ok: true, id: r?.key?.id || null, jid };
 }
 
 async function sendMedia({ to, type, url, caption }) {
   if (!sock || status !== "connected") throw new Error("not_connected");
-  const jid = jidFromPhone(to);
+  const jid = await resolveJid(to);
   let content;
   if (type === "image") content = { image: { url }, caption: caption || "" };
   else if (type === "video") content = { video: { url }, caption: caption || "" };
